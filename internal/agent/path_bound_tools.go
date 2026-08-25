@@ -9,6 +9,7 @@ import (
 
 	"reasonix/internal/tool"
 	"reasonix/internal/tool/builtin"
+	"reasonix/internal/workspacelease"
 )
 
 // pathBoundWriter wraps a built-in write tool so each Execute stays inside a
@@ -219,6 +220,25 @@ func parentWriteReservation(workDir, toolName string, args json.RawMessage) (Wri
 	}
 	// Bash and MCP/custom writers.
 	return WholeWorkspaceWriteClaim(workDir)
+}
+
+// workspaceLeaseClaim maps a tool call to the workspace write domain its
+// execution leases. Path-bound built-ins lease the concrete paths their
+// arguments name, so disjoint writes from different sessions run
+// concurrently; bash/MCP/custom writers lease the whole workspace because
+// their targets cannot be judged from arguments. The domain is the same one
+// parentWriteReservation claims for subagent scheduling, so both layers
+// agree on who may write where.
+func workspaceLeaseClaim(workDir string, t tool.Tool, args json.RawMessage) (workspacelease.Claim, error) {
+	set, err := parentWriteReservation(workDir, t.Name(), args)
+	if err != nil {
+		return workspacelease.Claim{}, err
+	}
+	return workspacelease.Claim{
+		Paths:          append([]string(nil), set.Paths...),
+		WholeWorkspace: set.WholeWorkspace,
+		WorkspaceRoot:  set.WorkspaceRoot,
+	}, nil
 }
 
 func extractWritePathsFromArgs(toolName, workDir string, args json.RawMessage) ([]string, error) {

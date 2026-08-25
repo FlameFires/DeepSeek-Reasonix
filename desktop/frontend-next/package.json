@@ -1,4 +1,9 @@
 {
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
   "name": "reasonix-frontend-next",
   "private": true,
   "type": "module",

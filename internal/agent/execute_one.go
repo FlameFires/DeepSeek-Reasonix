@@ -12,6 +12,7 @@ import (
 	"reasonix/internal/planmode"
 	"reasonix/internal/provider"
 	"reasonix/internal/tool"
+	"reasonix/internal/workspacelease"
 )
 
 // toolCallPlan holds the resolved, policy-checked state for one tool call.
@@ -47,6 +48,13 @@ type toolCallPlan struct {
 	cctx                 context.Context
 	releaseParentWrite   func()
 	releaseMutationWrite func()
+	// releaseWorkspaceLease returns the per-write workspace lease taken in
+	// prepareToolExecution; releaseWorkspaceVerification is the whole-workspace
+	// lease held only for the length of a verification call. Both are released
+	// by executeOne's deferred teardown, so a lease never outlives the write it
+	// protects and disjoint writes across sessions stay concurrent.
+	releaseWorkspaceLease        func()
+	releaseWorkspaceVerification func()
 
 	// pathsBefore is the state of the turn's known paths taken before an
 	// unclassifiable call ran, so its receipt can say what it actually touched.
@@ -84,6 +92,14 @@ func (a *Agent) executeOne(ctx context.Context, turn *turnRuntime, call provider
 		}
 		if plan.releaseParentWrite != nil {
 			plan.releaseParentWrite()
+		}
+		// The workspace leases go last: observation, mutation barrier, and the
+		// subagent scheduler all finish against the workspace the write left.
+		if plan.releaseWorkspaceLease != nil {
+			plan.releaseWorkspaceLease()
+		}
+		if plan.releaseWorkspaceVerification != nil {
+			plan.releaseWorkspaceVerification()
 		}
 		if plan.resolvedMeta == nil {
 			return
@@ -528,20 +544,6 @@ func (a *Agent) prepareToolExecution(ctx context.Context, plan *toolCallPlan) (t
 	if outcome, blocked := a.taskPolicyToolGate(plan); blocked {
 		return outcome, true
 	}
-	// Acquire after permission is granted but before PreToolUse: hooks are user
-	// shell code and can themselves change the workspace. This keeps readers
-	// concurrent and avoids holding the workspace during an approval prompt while
-	// still covering every write-side action that follows authorization.
-	// Lazy workspace lease on the first real writer for every role setting.
-	if plan.mutates && a.svc.workspaceLease != nil {
-		if err := a.svc.workspaceLease.AcquireWrite(ctx); err != nil {
-			return toolOutcome{
-				output:  fmt.Sprintf("blocked: the workspace did not become available for writing: %v", err),
-				blocked: true,
-				errMsg:  "blocked: workspace write lease unavailable",
-			}, true
-		}
-	}
 	// Resolve the concrete execution target before hooks. A proxy may carry a
 	// different target/name/argument set than the provider-visible call.
 	plan.runTool = plan.execTool
@@ -552,6 +554,48 @@ func (a *Agent) prepareToolExecution(ctx context.Context, plan *toolCallPlan) (t
 		if len(plan.runArgs) == 0 {
 			plan.runArgs = json.RawMessage(`{}`)
 		}
+	}
+	// Acquire the workspace lease for the concrete write domain before any
+	// hook runs: hooks are user shell code and can themselves change the
+	// workspace. Path-bound built-ins lease exactly the paths their arguments
+	// name, so a disjoint write in another session stays concurrent; bash,
+	// MCP, and custom writers lease the whole workspace because their targets
+	// cannot be judged. The lease is returned by executeOne's deferred
+	// teardown, so it is held for this write only, never for the whole turn.
+	if plan.mutates && a.svc.workspaceLease != nil {
+		claim, cerr := workspaceLeaseClaim(a.writeWorkspaceRoot, plan.runTool, plan.runArgs)
+		if cerr != nil {
+			return toolOutcome{
+				output:  fmt.Sprintf("blocked: the workspace write domain could not be resolved: %v", cerr),
+				blocked: true,
+				errMsg:  "blocked: workspace write lease unavailable",
+			}, true
+		}
+		release, lerr := a.svc.workspaceLease.AcquireWritePaths(ctx, claim)
+		if lerr != nil {
+			return toolOutcome{
+				output:  fmt.Sprintf("blocked: the workspace did not become available for writing: %v", lerr),
+				blocked: true,
+				errMsg:  "blocked: workspace write lease unavailable",
+			}, true
+		}
+		plan.releaseWorkspaceLease = release
+	}
+	// A verification call leases the whole workspace for the length of the
+	// command, so a check another session could invalidate mid-run stays
+	// stable — the narrow slice of the old hold-until-turn-end guarantee that
+	// concurrency still needs.
+	if plan.verification && a.svc.workspaceLease != nil {
+		release, lerr := a.svc.workspaceLease.AcquireWritePaths(ctx,
+			workspacelease.Claim{WholeWorkspace: true, WorkspaceRoot: a.writeWorkspaceRoot})
+		if lerr != nil {
+			return toolOutcome{
+				output:  fmt.Sprintf("blocked: the workspace did not become stable for verification: %v", lerr),
+				blocked: true,
+				errMsg:  "blocked: workspace write lease unavailable",
+			}, true
+		}
+		plan.releaseWorkspaceVerification = release
 	}
 	// Hold the parent claim before PreToolUse: hooks are user shell code and may
 	// mutate the same workspace. The reservation remains live through hooks,

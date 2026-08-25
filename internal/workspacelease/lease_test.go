@@ -23,6 +23,15 @@ func withWaitGrace(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { waitNoticeGrace = previous })
 }
 
+// withClaimTTL shortens how long a written claim survives, so a test can watch
+// expiry and crash recovery without waiting out the real one.
+func withClaimTTL(t *testing.T, d time.Duration) {
+	t.Helper()
+	previous := claimTTL
+	claimTTL = d
+	t.Cleanup(func() { claimTTL = previous })
+}
+
 // waitLog records what a session was told about one contended acquisition.
 type waitLog struct {
 	mu   sync.Mutex
@@ -437,6 +446,10 @@ func TestCrossProcessLeaseBlocksAndCrashReleases(t *testing.T) {
 		"REASONIX_WORKSPACE_LEASE_ROOT="+root,
 		"REASONIX_WORKSPACE_LEASE_DIR="+locks,
 		"REASONIX_WORKSPACE_LEASE_READY="+ready,
+		// The helper crashes holding the whole-workspace claim; a short claim
+		// TTL lets the stale row expire quickly instead of pinning the
+		// workspace for the real 30s.
+		"REASONIX_WORKSPACE_LEASE_TTL=300ms",
 	)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -478,4 +491,203 @@ func TestCrossProcessLeaseBlocksAndCrashReleases(t *testing.T) {
 		t.Fatalf("OS lease did not release after helper crash: %v", err)
 	}
 	o.EndRun()
+}
+
+// --- path-level leases (B + C) ---
+
+func pathClaim(root string, paths ...string) Claim {
+	return Claim{Paths: paths, WorkspaceRoot: root}
+}
+
+// The whole point of path leases: two sessions writing disjoint files in the
+// same workspace acquire concurrently instead of serializing behind one lock.
+func TestDisjointPathsAcquireConcurrently(t *testing.T) {
+	root, locks := t.TempDir(), t.TempDir()
+	first, _ := New(root, locks, nil)
+	second, _ := New(root, locks, nil)
+	first.BeginRun()
+	second.BeginRun()
+	defer first.EndRun()
+	defer second.EndRun()
+
+	releaseA, err := first.AcquireWritePaths(context.Background(), pathClaim(root, filepath.Join(root, "src", "a.go")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	releaseB, err := second.AcquireWritePaths(ctx, pathClaim(root, filepath.Join(root, "src", "b.go")))
+	if err != nil {
+		t.Fatalf("disjoint path blocked behind another writer: %v", err)
+	}
+	releaseA()
+	releaseB()
+}
+
+// The same path from two owners is still one writer at a time.
+func TestSamePathSerializesAcrossOwners(t *testing.T) {
+	root, locks := t.TempDir(), t.TempDir()
+	target := filepath.Join(root, "src", "a.go")
+	first, _ := New(root, locks, nil)
+	second, _ := New(root, locks, nil)
+	first.BeginRun()
+	second.BeginRun()
+	defer first.EndRun()
+	defer second.EndRun()
+
+	releaseA, err := first.AcquireWritePaths(context.Background(), pathClaim(root, target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	if _, err := second.AcquireWritePaths(ctx, pathClaim(root, target)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("same path acquired while first held it: %v", err)
+	}
+	releaseA()
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	releaseB, err := second.AcquireWritePaths(ctx, pathClaim(root, target))
+	if err != nil {
+		t.Fatalf("same path stayed blocked after release: %v", err)
+	}
+	releaseB()
+}
+
+// Whole-workspace claims (bash, verification) and path claims are mutually
+// exclusive in both directions.
+func TestWholeBlocksPathsAndPathsBlockWhole(t *testing.T) {
+	root, locks := t.TempDir(), t.TempDir()
+	target := filepath.Join(root, "src", "a.go")
+
+	first, _ := New(root, locks, nil)
+	second, _ := New(root, locks, nil)
+	first.BeginRun()
+	second.BeginRun()
+	defer first.EndRun()
+	defer second.EndRun()
+
+	// Whole held by first blocks a path claim from second.
+	if err := first.AcquireWrite(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	if _, err := second.AcquireWritePaths(ctx, pathClaim(root, target)); !errors.Is(err, context.DeadlineExceeded) {
+		cancel()
+		t.Fatalf("path acquired while whole workspace held: %v", err)
+	}
+	cancel()
+	first.EndRun()
+	// first.EndRun drops activeRuns to 0 and releases the whole claim.
+
+	// Path held by second blocks a whole claim from first.
+	releasePath, err := second.AcquireWritePaths(context.Background(), pathClaim(root, target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 80*time.Millisecond)
+	if err := first.AcquireWrite(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		cancel()
+		t.Fatalf("whole workspace acquired while path held: %v", err)
+	}
+	cancel()
+	releasePath()
+}
+
+// A parent directory claim conflicts with a child file claim.
+func TestParentPathBlocksChildPath(t *testing.T) {
+	root, locks := t.TempDir(), t.TempDir()
+	dir := filepath.Join(root, "src")
+	file := filepath.Join(dir, "a.go")
+	first, _ := New(root, locks, nil)
+	second, _ := New(root, locks, nil)
+	first.BeginRun()
+	second.BeginRun()
+	defer first.EndRun()
+	defer second.EndRun()
+
+	releaseDir, err := first.AcquireWritePaths(context.Background(), pathClaim(root, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	if _, err := second.AcquireWritePaths(ctx, pathClaim(root, file)); !errors.Is(err, context.DeadlineExceeded) {
+		cancel()
+		t.Fatalf("child path acquired while parent dir held: %v", err)
+	}
+	cancel()
+	releaseDir()
+}
+
+// A crashed owner's stale claim stops blocking once it expires.
+func TestExpiredClaimStopsBlocking(t *testing.T) {
+	withClaimTTL(t, 60*time.Millisecond)
+	root, locks := t.TempDir(), t.TempDir()
+	target := filepath.Join(root, "src", "a.go")
+	first, _ := New(root, locks, nil)
+	second, _ := New(root, locks, nil)
+	first.BeginRun()
+	second.BeginRun()
+	defer first.EndRun()
+	defer second.EndRun()
+
+	releaseA, err := first.AcquireWritePaths(context.Background(), pathClaim(root, target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash: never release, let the row expire.
+	_ = releaseA
+	time.Sleep(150 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	releaseB, err := second.AcquireWritePaths(ctx, pathClaim(root, target))
+	if err != nil {
+		t.Fatalf("expired claim kept blocking: %v", err)
+	}
+	releaseB()
+}
+
+// EndRun releases claims a write tool forgot to release explicitly.
+func TestEndRunReleasesUnreleasedClaims(t *testing.T) {
+	root, locks := t.TempDir(), t.TempDir()
+	target := filepath.Join(root, "src", "a.go")
+	first, _ := New(root, locks, nil)
+	second, _ := New(root, locks, nil)
+	first.BeginRun()
+	second.BeginRun()
+	defer second.EndRun()
+
+	if _, err := first.AcquireWritePaths(context.Background(), pathClaim(root, target)); err != nil {
+		t.Fatal(err)
+	}
+	first.EndRun()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	releaseB, err := second.AcquireWritePaths(ctx, pathClaim(root, target))
+	if err != nil {
+		t.Fatalf("EndRun did not release the held claim: %v", err)
+	}
+	releaseB()
+}
+
+// A claim is re-entrant inside one owner even across parallel acquisitions.
+func TestPathsReentrantWithinOwner(t *testing.T) {
+	root, locks := t.TempDir(), t.TempDir()
+	target := filepath.Join(root, "src", "a.go")
+	o, _ := New(root, locks, nil)
+	o.BeginRun()
+	defer o.EndRun()
+	releaseA, err := o.AcquireWritePaths(context.Background(), pathClaim(root, target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	releaseB, err := o.AcquireWritePaths(ctx, pathClaim(root, target))
+	if err != nil {
+		t.Fatalf("re-entrant path acquire failed: %v", err)
+	}
+	releaseA()
+	releaseB()
 }

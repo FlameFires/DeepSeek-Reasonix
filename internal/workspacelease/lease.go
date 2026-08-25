@@ -1,16 +1,30 @@
 // Package workspacelease serializes Delivery writers that target the same
-// workspace. Readers never acquire a lease. A writer keeps its lease from the
-// first mutation until every participating agent run has finished, so review
-// and verification cannot be invalidated by another Delivery session changing
-// the workspace mid-turn. It never outlives those runs: a process a session
-// leaves behind, a dev server or a watcher, is not a run, and an exclusion
-// another session cannot outwait is worse than no exclusion at all.
+// workspace. Readers never acquire a lease.
+//
+// A writer leases the workspace for the single write it is about to perform,
+// not for the whole turn: path-bound writers (write_file, edit_file, …) lease
+// exactly the paths their arguments name, and opaque writers (bash, MCP)
+// lease the whole workspace, because their targets cannot be judged from
+// arguments. The lease is released when that write finishes, so two sessions
+// writing disjoint paths run concurrently and a session that only reads never
+// waits. Verification calls re-acquire the whole workspace for the length of
+// the command, so a check another session could invalidate mid-run stays
+// stable.
+//
+// Cross-process serialization is a short-lived arbiter file lock guarding a
+// claims table: every live acquisition is a row {owner, domain, expiry}, and
+// the row is the only thing that outlives the critical section. A crashed
+// process is recovered by the expiry alone — the arbiter lock itself dies
+// with its process, and the stale row stops blocking after claimTTL — so the
+// lease never needs a watcher to clean it up.
 package workspacelease
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -23,6 +37,22 @@ import (
 
 const retryInterval = 75 * time.Millisecond
 
+// claimTTL is how long a written claim survives without the writer doing
+// anything. It bounds crash recovery (a dead session blocks the paths it had
+// leased for at most this long) and doubles as the longest any lease is held
+// without being refreshed — which is fine, because the lease is re-acquired
+// for every write. Tests shorten it to watch expiry without waiting out the
+// real one; the cross-process crash test shortens it in the helper too.
+var claimTTL = 30 * time.Second
+
+func init() {
+	if v := os.Getenv("REASONIX_WORKSPACE_LEASE_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			claimTTL = d
+		}
+	}
+}
+
 // waitNoticeGrace is how long a contended acquisition stays silent. Contention
 // is either milliseconds, another session between two writes, or the length of
 // a whole turn, and reporting the first kind leaves a permanent line about a
@@ -30,6 +60,10 @@ const retryInterval = 75 * time.Millisecond
 var waitNoticeGrace = time.Second
 
 var errHeld = errors.New("workspace write lease is held")
+
+// errClaimConflict is returned inside an arbiter critical section when the
+// requested domain overlaps a live claim held by another session.
+var errClaimConflict = errors.New("workspace write claim conflicts with another session")
 
 // WaitOutcome says which end of a contended acquisition a Wait reports.
 type WaitOutcome int
@@ -59,18 +93,31 @@ type WaitNotice func(Wait)
 // shared by the root agent and all of its subagents. Different sessions must
 // use different Owners, even when they share a workspace.
 type Owner struct {
-	lockPath string
-	onWait   WaitNotice
-	local    *localLock
+	root    string // canonical workspace root this owner protects
+	wkDir   string // lockDir/<wkKey>: this workspace's per-workspace lock domain
+	arbiter string // wkDir/arbiter.lock: short-lived cross-process arbiter
+	claims  string // wkDir/claims.json: the live claims table
+	id      string // unique identity of this owner inside the claims table
+	onWait  WaitNotice
 
-	mu            sync.Mutex
-	activeRuns    int
-	acquired      bool
-	acquiring     bool
-	waiting       bool
-	acquireDone   chan struct{}
-	releaseSystem func()
+	// localMu serializes arbiter critical sections inside this process; the
+	// arbiter file lock serializes them across processes. Held for the length
+	// of a critical section only — never for the lease itself, so disjoint
+	// leases in one process still run concurrently.
+	localMu *sync.Mutex
+
+	mu         sync.Mutex
+	activeRuns int
+	waiting    bool
+	held       []Claim // locally held claims; EndRun releases the rest
 }
+
+// arbiterRegistry hands every Owner of one workspace the same in-process
+// mutex, so two sessions in one process never race the arbiter file lock.
+var arbiterRegistry = struct {
+	sync.Mutex
+	m map[string]*sync.Mutex
+}{m: map[string]*sync.Mutex{}}
 
 // State is a sanitized process-local snapshot used by Desktop to explain a
 // workspace conflict. It deliberately contains no path, PID, or lock token.
@@ -86,17 +133,8 @@ func (o *Owner) State() State {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return State{Acquired: o.acquired, Waiting: o.waiting}
+	return State{Acquired: len(o.held) > 0, Waiting: o.waiting}
 }
-
-type localLock struct {
-	token chan struct{}
-}
-
-var localRegistry = struct {
-	sync.Mutex
-	locks map[string]*localLock
-}{locks: map[string]*localLock{}}
 
 // New returns a Delivery-session lease owner for workspaceRoot. lockDir must be
 // shared by Reasonix processes for cross-process protection; it is kept outside
@@ -115,21 +153,39 @@ func New(workspaceRoot, lockDir string, onWait WaitNotice) (*Owner, error) {
 	}
 	sum := sha256.Sum256([]byte(canonical))
 	key := hex.EncodeToString(sum[:])
-
-	localRegistry.Lock()
-	local := localRegistry.locks[key]
-	if local == nil {
-		local = &localLock{token: make(chan struct{}, 1)}
-		local.token <- struct{}{}
-		localRegistry.locks[key] = local
+	wkDir := filepath.Join(lockDir, key)
+	if err := os.MkdirAll(wkDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create workspace lease domain: %w", err)
 	}
-	localRegistry.Unlock()
+
+	arbiterRegistry.Lock()
+	localMu := arbiterRegistry.m[wkDir]
+	if localMu == nil {
+		localMu = &sync.Mutex{}
+		arbiterRegistry.m[wkDir] = localMu
+	}
+	arbiterRegistry.Unlock()
 
 	return &Owner{
-		lockPath: filepath.Join(lockDir, key+".lock"),
-		onWait:   onWait,
-		local:    local,
+		root:    canonical,
+		wkDir:   wkDir,
+		arbiter: filepath.Join(wkDir, "arbiter.lock"),
+		claims:  filepath.Join(wkDir, "claims.json"),
+		id:      newOwnerID(),
+		onWait:  onWait,
+		localMu: localMu,
 	}, nil
+}
+
+// newOwnerID returns a random identity for the claims table. The fallback is
+// only reachable if the host entropy source fails entirely, and uniqueness
+// within one host is all the table needs.
+func newOwnerID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // CanonicalWorkspace returns the stable identity used to key a workspace. It
@@ -179,7 +235,7 @@ func nearestGitWorktreeRoot(path string) string {
 }
 
 // BeginRun registers an agent run that participates in this session. The call
-// is intentionally cheap and does not acquire the write lease; read-only turns
+// is intentionally cheap and does not acquire any lease; read-only turns
 // therefore remain fully concurrent.
 func (o *Owner) BeginRun() {
 	if o == nil {
@@ -190,7 +246,10 @@ func (o *Owner) BeginRun() {
 	o.mu.Unlock()
 }
 
-// EndRun releases the lease once the final participating run finishes.
+// EndRun releases every lease this session still holds once the final
+// participating run finishes. It is the safety net under explicit per-write
+// releases: a write tool that forgot to release its lease (or was cancelled
+// mid-flight) stops blocking other sessions here instead of at claimTTL.
 func (o *Owner) EndRun() {
 	if o == nil {
 		return
@@ -199,69 +258,296 @@ func (o *Owner) EndRun() {
 	if o.activeRuns > 0 {
 		o.activeRuns--
 	}
-	release := o.releaseIfIdleLocked()
+	toRelease := o.releaseIfIdleLocked()
 	o.mu.Unlock()
-	if release != nil {
-		release()
+	for _, c := range toRelease {
+		o.releaseClaim(c)
 	}
 }
 
-// AcquireWrite lazily acquires this session's exclusive write lease. It is
+func (o *Owner) releaseIfIdleLocked() []Claim {
+	if o.activeRuns != 0 || len(o.held) == 0 {
+		return nil
+	}
+	all := o.held
+	o.held = nil
+	return all
+}
+
+// AcquireWrite acquires this session's exclusive whole-workspace lease and
+// holds it until EndRun. It is the coarse surface for callers that cannot name
+// their write domain (bash, MCP, verification) or that manage the release
+// themselves; path-bound tool calls should prefer AcquireWritePaths. It is
 // re-entrant across parallel tool calls and shared subagents.
 func (o *Owner) AcquireWrite(ctx context.Context) error {
 	if o == nil {
 		return nil
 	}
+	return o.acquireClaim(ctx, Claim{WholeWorkspace: true, WorkspaceRoot: o.root})
+}
+
+// AcquireWritePaths acquires a lease for exactly the requested write domain
+// and returns the release that returns it once the write is done. Disjoint
+// claims from other sessions never wait for each other; overlapping ones wait
+// until the holder releases or its claim expires. Re-entrant within this
+// owner: a claim already held by this session never conflicts with itself.
+func (o *Owner) AcquireWritePaths(ctx context.Context, c Claim) (func(), error) {
+	if o == nil {
+		return noopRelease, nil
+	}
+	if c.Empty() {
+		return noopRelease, nil
+	}
+	if err := o.acquireClaim(ctx, c); err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() { o.releaseClaim(c) })
+	}, nil
+}
+
+func noopRelease() {}
+
+func (o *Owner) acquireClaim(ctx context.Context, c Claim) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	w := &waitClock{owner: o}
 	for {
-		o.mu.Lock()
-		if o.acquired {
-			o.mu.Unlock()
-			return nil
-		}
-		if o.acquiring {
-			done := o.acquireDone
-			o.mu.Unlock()
-			select {
-			case <-done:
-				continue
-			case <-ctx.Done():
+		acquired, err := o.tryAcquireOnce(ctx, c)
+		if err != nil {
+			if ctx.Err() != nil {
+				w.close(WaitAbandoned)
 				return ctx.Err()
 			}
+			return err
 		}
-		o.acquiring = true
-		o.acquireDone = make(chan struct{})
-		done := o.acquireDone
-		o.mu.Unlock()
-
-		release, err := o.acquire(ctx)
-		o.mu.Lock()
-		o.acquiring = false
-		o.waiting = false
-		if err == nil {
-			o.acquired = true
-			o.releaseSystem = release
+		if acquired {
+			o.mu.Lock()
+			o.held = append(o.held, c)
+			o.waiting = false
+			o.mu.Unlock()
+			w.close(WaitAcquired)
+			return nil
 		}
-		close(done)
-		releaseIfIdle := o.releaseIfIdleLocked()
-		o.mu.Unlock()
-		if releaseIfIdle != nil {
-			releaseIfIdle()
+		// The domain conflicts with a live claim: wait and retry.
+		w.contend()
+		w.report()
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			w.close(WaitAbandoned)
+			return ctx.Err()
 		}
-		return err
 	}
 }
 
-func (o *Owner) releaseIfIdleLocked() func() {
-	if !o.acquired || o.acquiring || o.activeRuns != 0 {
+// tryAcquireOnce runs one arbiter-protected attempt. acquired=false with a nil
+// error means the domain conflicts with a live claim held by another session;
+// the caller retries until the holder releases or its claim expires.
+func (o *Owner) tryAcquireOnce(ctx context.Context, c Claim) (acquired bool, err error) {
+	err = o.withArbiter(ctx, func() error {
+		recs, err := o.readClaims()
+		if err != nil {
+			return err
+		}
+		recs = pruneExpired(recs)
+		if o.conflicts(recs, c) {
+			return errClaimConflict
+		}
+		recs = append(recs, claimRecord{
+			ID:      o.id,
+			Whole:   c.WholeWorkspace,
+			Root:    c.WorkspaceRoot,
+			Paths:   c.Paths,
+			Expires: time.Now().Add(claimTTL),
+		})
+		if err := o.writeClaims(recs); err != nil {
+			return err
+		}
+		acquired = true
 		return nil
+	})
+	if errors.Is(err, errClaimConflict) {
+		return false, nil
 	}
-	release := o.releaseSystem
-	o.acquired = false
-	o.releaseSystem = nil
-	return release
+	if err != nil {
+		return false, err
+	}
+	return acquired, nil
+}
+
+// withArbiter serializes one claims-table critical section. The in-process
+// mutex covers sessions in one process; the arbiter file lock covers sessions
+// across processes and dies with a crashed process. Never held beyond fn.
+func (o *Owner) withArbiter(ctx context.Context, fn func() error) error {
+	o.localMu.Lock()
+	defer o.localMu.Unlock()
+	release, err := o.lockArbiter(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn()
+}
+
+func (o *Owner) lockArbiter(ctx context.Context) (func(), error) {
+	for {
+		release, err := tryLockFile(o.arbiter)
+		if err == nil {
+			return release, nil
+		}
+		if !errors.Is(err, errHeld) {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(retryInterval):
+		}
+	}
+}
+
+// claimRecord is one live acquisition in the claims table.
+type claimRecord struct {
+	ID      string    `json:"id"`
+	Whole   bool      `json:"whole,omitempty"`
+	Root    string    `json:"root,omitempty"`
+	Paths   []string  `json:"paths,omitempty"`
+	Expires time.Time `json:"expires"`
+}
+
+func (o *Owner) readClaims() ([]claimRecord, error) {
+	data, err := os.ReadFile(o.claims)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var recs []claimRecord
+	if err := json.Unmarshal(data, &recs); err != nil {
+		return nil, err
+	}
+	return recs, nil
+}
+
+func (o *Owner) writeClaims(recs []claimRecord) error {
+	data, err := json.Marshal(recs)
+	if err != nil {
+		return err
+	}
+	tmp := o.claims + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, o.claims)
+}
+
+// pruneExpired drops claims whose expiry has passed. The table is only
+// rewritten inside an arbiter critical section, so pruning is atomic with
+// respect to every other reader and writer.
+func pruneExpired(recs []claimRecord) []claimRecord {
+	now := time.Now()
+	out := recs[:0]
+	for _, r := range recs {
+		if r.Expires.Before(now) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// conflicts reports whether c overlaps any live claim held by another owner.
+// This owner's own claims never conflict, which is what makes acquisition
+// re-entrant across parallel tool calls and shared subagents.
+func (o *Owner) conflicts(recs []claimRecord, c Claim) bool {
+	for _, r := range recs {
+		if r.ID == o.id {
+			continue
+		}
+		other := Claim{Paths: r.Paths, WholeWorkspace: r.Whole, WorkspaceRoot: r.Root}
+		if c.Overlaps(other) {
+			return true
+		}
+	}
+	return false
+}
+
+// releaseClaim returns one locally held claim to the table. Best effort: if
+// the arbiter cannot be reached the stale row expires on its own after
+// claimTTL, which is the same recovery a crashed session gets.
+func (o *Owner) releaseClaim(c Claim) {
+	o.mu.Lock()
+	kept := o.held[:0]
+	for _, h := range o.held {
+		if !claimEqual(h, c) {
+			kept = append(kept, h)
+		}
+	}
+	o.held = kept
+	o.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = o.withArbiter(ctx, func() error {
+		recs, err := o.readClaims()
+		if err != nil {
+			return err
+		}
+		out := recs[:0]
+		for _, r := range recs {
+			if r.ID == o.id && recordMatches(r, c) {
+				continue
+			}
+			out = append(out, r)
+		}
+		return o.writeClaims(out)
+	})
+}
+
+func claimEqual(a, b Claim) bool {
+	if a.WholeWorkspace != b.WholeWorkspace || !sameFold(a.WorkspaceRoot, b.WorkspaceRoot) {
+		return false
+	}
+	if len(a.Paths) != len(b.Paths) {
+		return false
+	}
+	for i := range a.Paths {
+		if !sameFold(a.Paths[i], b.Paths[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func recordMatches(r claimRecord, c Claim) bool {
+	return r.Whole == c.WholeWorkspace && sameFold(r.Root, c.WorkspaceRoot) && sameFoldSlice(r.Paths, c.Paths)
+}
+
+func sameFoldSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !sameFold(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameFold(a, b string) bool {
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }
 
 func (o *Owner) notify(w Wait) {
@@ -303,76 +589,5 @@ func (w *waitClock) report() {
 func (w *waitClock) close(outcome WaitOutcome) {
 	if w.began {
 		w.owner.notify(Wait{Outcome: outcome, Elapsed: time.Since(w.started)})
-	}
-}
-
-func (w *waitClock) remainingGrace() time.Duration {
-	if left := waitNoticeGrace - time.Since(w.started); left > 0 {
-		return left
-	}
-	return time.Nanosecond
-}
-
-// awaitToken waits for the in-process token. The grace timer is dropped once
-// the report is out, so a long wait stops waking to re-decide it.
-func (o *Owner) awaitToken(ctx context.Context, w *waitClock) error {
-	w.contend()
-	timer := time.NewTimer(w.remainingGrace())
-	defer timer.Stop()
-	grace := timer.C
-	for {
-		select {
-		case <-o.local.token:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-grace:
-			w.report()
-			grace = nil
-		}
-	}
-}
-
-func (o *Owner) acquire(ctx context.Context) (func(), error) {
-	w := &waitClock{owner: o}
-	select {
-	case <-o.local.token:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-		if err := o.awaitToken(ctx, w); err != nil {
-			w.close(WaitAbandoned)
-			return nil, err
-		}
-	}
-
-	releaseLocal := func() { o.local.token <- struct{}{} }
-	for {
-		releaseFile, err := tryLockFile(o.lockPath)
-		if err == nil {
-			w.close(WaitAcquired)
-			return func() {
-				releaseFile()
-				releaseLocal()
-			}, nil
-		}
-		if !errors.Is(err, errHeld) {
-			releaseLocal()
-			w.close(WaitAbandoned)
-			return nil, fmt.Errorf("acquire workspace write lease: %w", err)
-		}
-		w.contend()
-		w.report()
-		timer := time.NewTimer(retryInterval)
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			releaseLocal()
-			w.close(WaitAbandoned)
-			return nil, ctx.Err()
-		}
 	}
 }
