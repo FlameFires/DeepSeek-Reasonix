@@ -692,8 +692,11 @@
      必须断掉：一条 .34s 的补间会让栏追着指针跑，手感是黏的。 */
   .app {
     --nav-w: 46px; --rail-w: var(--rail-open); --side-w: var(--side-open);
-    transition: --rail-w var(--t-panel) cubic-bezier(.32, .72, 0, 1), --side-w var(--t-panel) cubic-bezier(.32, .72, 0, 1);
+    transition: --nav-w var(--t-panel) cubic-bezier(.32, .72, 0, 1), --rail-w var(--t-panel) cubic-bezier(.32, .72, 0, 1), --side-w var(--t-panel) cubic-bezier(.32, .72, 0, 1);
   }
+  /* 图标栏的显示与否是设置里的一个开关（外观 → 侧边栏），不是窄度的推断：
+     它不承载内容，关掉是品味，不是让路。 */
+  .app[data-nav="off"] { --nav-w: 0px }
   .app[data-rail="off"] { --rail-w: 0px }
   .app[data-side="off"] { --side-w: 0px }
   .app[data-drag] { transition: none }
@@ -701,6 +704,14 @@
   .app[data-drag="pointer"] * { cursor: col-resize }
 
   .cols { flex: 1; display: grid; grid-template-columns: var(--nav-w) var(--rail-w) minmax(0, 1fr) var(--side-w); min-height: 0 }
+  /* 各列钉在自己的轨道上。图标栏收起时它整个从 DOM 里拿掉（留着的话键盘焦点
+     会落进一列看不见的按钮），而不钉住的网格是按子元素顺序落格的：第一个孩子
+     一消失，后面每一列都往前挪一格 —— 工作区栏滑进那条 0 宽的轨道，看上去就
+     像被一起关掉了。 */
+  .cols > .nav { grid-column: 1 }
+  .cols > .rail { grid-column: 2 }
+  .cols > .main { grid-column: 3 }
+  .cols > .side { grid-column: 4 }
   .rail, .side { overflow: hidden }
   [data-rail="off"] .rail { border-right: 0 }
   [data-side="off"] .side { border-left: 0 }
@@ -2462,6 +2473,9 @@
 
   /* 滚动条出现时不让整栏横向跳一下。 */
   .rail .scroll, .side .scroll { scrollbar-gutter: stable }
+
+  /* 树行自带 6px 内边距，再在容器左缘垫 4px：行与上方搜索框（10px 外边距）对齐。 */
+  .rail .scroll { padding-left: 4px }
 
   .drow { display: flex; align-items: baseline; gap: 10px; min-height: 21px }
   .drow .k { color: var(--faint); font: var(--w-reg) 12px var(--ui) }
@@ -4595,7 +4609,7 @@
      行唯一无法从别处读到的东西。「+」跨两行，因为它属于整个节点。 */
   .wsrow {
     position: relative; display: grid; gap: 0 7px; align-items: center;
-    grid-template-columns: 10px 5px minmax(0, 1fr) auto;
+    grid-template-columns: 10px 5px minmax(0, 1fr);
     padding: 6px 6px 7px 6px; border-radius: var(--r-sm); cursor: pointer;
     font: var(--w-med) 12.5px var(--ui); color: var(--muted);
     transition: background .14s, color .14s;
@@ -4604,9 +4618,6 @@
   .wsdot { grid-area: 1 / 2 }
   .wsname { grid-area: 1 / 3 }
   .wsmeta { grid-area: 2 / 3; justify-self: start; margin-top: 1px }
-  /* 跟名字对齐，不是跟两行的中点对齐。转角、圆点、名字的中心在同一条线上，
-     芯片跨两行居中就比它们低 8px —— 胉下来就是一排东西里只有它歪。 */
-  .wsacts { grid-area: 1 / 4; align-self: center }
   .wsrow:hover { background: var(--overlay); color: var(--text) }
   /* 选中的是项目节点，不是会话行：金色底 + 左边一条带辉的竖条，两行一起
      包在里面。会话行只给中性底，没有竖条 —— 两个层级各自有自己的记号，
@@ -4644,9 +4655,20 @@
     font-style: normal; flex: none; padding: 0 4px; border-radius: var(--r-xs);
     background: var(--overlay); color: var(--faint);
   }
-  .wsacts { display: flex; align-items: center; gap: 2px }
-  /* 常驻，不是 hover 才出现：一个看不见的入口读起来就是没有这个功能。删除比
-     新建安静一档，靠的是对比度，不是可见性。 */
+  /* 动作浮在名字的尾巴上，不占一列：hover 才出现。在 214px 的栏里它们常驻时，
+     被截掉的总是名字 —— 而那正是这一行唯一无法从别处读到的东西。名字的最后
+     几个字在 hover 时让给它们（mask 淡出），浮着的不遮字。 */
+  .wsacts {
+    position: absolute; top: 6px; right: 6px;
+    display: flex; align-items: center; gap: 2px;
+    opacity: 0; pointer-events: none;
+    transition: opacity var(--t-line) var(--ease);
+  }
+  .wsrow:hover .wsacts, .wsacts:focus-within { opacity: 1; pointer-events: auto }
+  .wsrow:hover .wsname {
+    -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 52px), transparent);
+    mask-image: linear-gradient(90deg, #000 calc(100% - 52px), transparent);
+  }
   /* 和栏顶那个加号（.addws）同一套：透明底、描边图标、悬停才上底。
      之前那个填色芯片 + 内环是另一套语言，放进来就是一块外来的东西。
      图标用 SVG 而不是字符：place-items 对齐的是行盒，一个“+”字形在行盒里靠
@@ -4709,13 +4731,28 @@
   .sesscopies[aria-expanded="true"] { border-color: var(--warn); color: var(--warn-ink) }
   .sessrow.sesscopy { padding-left: 34px }
   .sessrow.sesscopy .sesstitle { color: var(--ghost); font-style: italic }
-  .sessrow .wsdel, .sessrow .sessedit-btn { opacity: 0 }
-  .sessrow:hover .wsdel, .sessrow:hover .sessedit-btn,
-  .sessrow .wsdel:focus-visible, .sessrow .sessedit-btn:focus-visible { opacity: 1 }
+  /* 尾注（轮数、副本）与动作收进一块。动作不再占版面：锚在尾注的左边、浮在
+     标题的尾巴上，hover 才亮 —— 常驻时它们从 214px 的栏里分走一列，标题剩下
+     的字数读不成句。尾注自己还在原位，副本芯片也照常可点。 */
+  .sessend { position: relative; flex: none; display: flex; align-items: center; gap: 5px }
+  .sessacts {
+    position: absolute; right: calc(100% + 6px); top: 50%; translate: 0 -50%;
+    display: flex; align-items: center; gap: 2px;
+    opacity: 0; pointer-events: none;
+    transition: opacity var(--t-line) var(--ease);
+  }
+  .sessrow:hover .sessacts, .sessacts:focus-within { opacity: 1; pointer-events: auto }
+  /* 改名进行中时动作藏掉：它们会正好浮在输入框的右端上，落笔就是误删。 */
+  .sessrow[data-editing] .sessacts { visibility: hidden }
+  /* 亮起来的动作压着标题的最后几个字：不是遮住它们，是让它们淡出去。 */
+  .sessrow:hover .sesstitle {
+    -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 48px), transparent);
+    mask-image: linear-gradient(90deg, #000 calc(100% - 48px), transparent);
+  }
   .sessedit-btn {
-    flex: none; width: 18px; height: 18px; display: grid; place-items: center;
+    width: 18px; height: 18px; display: grid; place-items: center;
     border: 0; border-radius: var(--r-xs); background: transparent; color: var(--ghost);
-    font: var(--w-reg) 10px/1 var(--mono); cursor: pointer; transition: opacity .14s, color .14s;
+    font: var(--w-reg) 10px/1 var(--mono); cursor: pointer; transition: color .14s;
   }
   .sessedit-btn:hover { color: var(--accent-ink) }
   .sessedit {
@@ -5289,13 +5326,13 @@
   .tabconfirm .a button[data-danger] { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--border)) }
   .tabconfirm .a button[data-danger]:hover { background: var(--err); border-color: var(--err); color: var(--accent-fg) }
 
-  /* .wsdel 的绝对定位是给旧的会话卡片写的，在树的 flex 行里它会浮在行尾、
-     正好压住旁边的铅笔。树里的按钮一律回到流内，并排排在行尾。 */
+  /* 树里的动作不再各自占位（.sessacts / .wsacts 负责浮与显），这里只把基准
+     .wsdel 的绝对定位收回流内、确认色留在这儿。按钮本身常亮，显不显由浮层
+     的透明度说了算。 */
   .sessrow .wsdel, .wsrow .wsdel {
     position: static; top: auto; right: auto; flex: none;
-    background: transparent;
+    background: transparent; opacity: 1;
   }
-  .wsrow .wsdel { opacity: 1 }
   .sessrow .wsdel:hover, .wsrow .wsdel:hover { background: var(--border); color: var(--err) }
 
   /* 页签是控件不是正文：能选中文字的话，右键出来的永远是系统菜单，自己的

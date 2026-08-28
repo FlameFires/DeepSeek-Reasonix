@@ -76,6 +76,8 @@ interface Props {
   look: Look;
   onLook: (look: Look) => void;
   onContrast: (c: string) => void;
+  nav: boolean;
+  onNav: (v: boolean) => void;
   onClose: () => void;
   onChanged: () => void;
   at?: string;
@@ -83,7 +85,7 @@ interface Props {
   reloadAccount: () => void;
 }
 
-export function Settings({ hub, onError, port, status, theme, onTheme, contrast, onContrast, weight, onWeight, look, onLook, onClose, onChanged, reloadThemes, at: opened, account: acct, reloadAccount }: Props) {
+export function Settings({ hub, onError, port, status, theme, onTheme, contrast, onContrast, weight, onWeight, look, onLook, nav: navOpen, onNav, onClose, onChanged, reloadThemes, at: opened, account: acct, reloadAccount }: Props) {
   const [at, setAt] = useState<Section>((opened as Section) || "session");
   const [models, setModels] = useState<ModelEntry[]>([]);
   const [roles, setRoles] = useState<RoleAssignments | null>(null);
@@ -641,7 +643,7 @@ export function Settings({ hub, onError, port, status, theme, onTheme, contrast,
           )}
 
           {at === "appearance" && (
-            <Appearance port={port} theme={theme} onTheme={onTheme} contrast={contrast} onContrast={onContrast} weight={weight} onWeight={onWeight} reloadThemes={reloadThemes} look={look} onLook={onLook} />
+            <Appearance port={port} theme={theme} onTheme={onTheme} contrast={contrast} onContrast={onContrast} weight={weight} onWeight={onWeight} reloadThemes={reloadThemes} look={look} onLook={onLook} nav={navOpen} onNav={onNav} />
           )}
 
           {at === "advanced" && (

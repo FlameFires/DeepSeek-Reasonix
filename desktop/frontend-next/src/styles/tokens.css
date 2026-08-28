@@ -41,6 +41,8 @@
 
 @property --rail-w { syntax: "<length>"; inherits: true; initial-value: 214px }
 @property --side-w { syntax: "<length>"; inherits: true; initial-value: 296px }
+/* 图标栏的宽是常数，但「关掉」要看得见：跟另两栏一样注册成长度才能补间。 */
+@property --nav-w { syntax: "<length>"; inherits: true; initial-value: 46px }
 /* Registered so a bad write falls back to 16:10 rather than making aspect-ratio
    invalid, which would collapse every box using it to zero height. */
 @property --win-ar { syntax: "<number>"; inherits: true; initial-value: 1.6 }

@@ -81,6 +81,16 @@ export function App({ hub }: { hub: HubPort }) {
       return next;
     });
   }, []);
+  // The icon rail answers "what does this screen show me", so like the columns
+  // it is a per-machine choice kept in localStorage, not in the kernel.
+  const [nav, setNav] = useState(() => localStorage.getItem("rx-nav") !== "0");
+  const chooseNav = useCallback((v: boolean | ((p: boolean) => boolean)) => {
+    setNav((cur) => {
+      const next = typeof v === "function" ? v(cur) : v;
+      localStorage.setItem("rx-nav", next ? "1" : "0");
+      return next;
+    });
+  }, []);
   const [railW, setRailW] = useState(() => widthOf(RAIL));
   const [sideW, setSideW] = useState(() => widthOf(SIDE));
   const [report, setReport] = useState<PaneReport>(NO_REPORT);
@@ -517,6 +527,7 @@ export function App({ hub }: { hub: HubPort }) {
       data-run={report.run}
       data-rail={rail ? "on" : "off"}
       data-side={side ? "on" : "off"}
+      data-nav={nav ? "on" : "off"}
       data-plan={report.status?.plan ? "on" : "off"}
       data-apv={report.status?.toolApprovalMode ?? "ask"}
       data-prefs={settings ? "" : undefined}
@@ -542,11 +553,15 @@ export function App({ hub }: { hub: HubPort }) {
       {pack?.sky && <Sky />}
 
       <div className="cols">
-        <Nav
-          at={settings === false ? null : settings === true ? "" : settings}
-          onGo={showPrefs}
-          onHome={hidePrefs}
-        />
+        {/* 收起是不渲染，不是收到 0：留在 DOM 里的话键盘焦点会落进一列看不见
+            的按钮里。设置的门在顶栏上，关掉这一列不关掉任何去处。 */}
+        {nav && (
+          <Nav
+            at={settings === false ? null : settings === true ? "" : settings}
+            onGo={showPrefs}
+            onHome={hidePrefs}
+          />
+        )}
         <div className="rail">
           <div className="railscroll">
           <Workspaces
@@ -703,6 +718,8 @@ export function App({ hub }: { hub: HubPort }) {
           look={look}
           onLook={onLook}
           onContrast={setContrast}
+          nav={nav}
+          onNav={chooseNav}
           onClose={hidePrefs}
           onChanged={onSettingsChanged}
           reloadThemes={reloadThemes}

@@ -32,6 +32,8 @@ interface Props {
   reloadThemes: () => void;
   look: Look;
   onLook: (look: Look) => void;
+  nav: boolean;
+  onNav: (v: boolean) => void;
 }
 
 // Whole-interface scale. Named by what it does to reading rather than by its
@@ -107,7 +109,7 @@ function useCrop(url: string | undefined, box: HTMLElement | null) {
   return { known, x: !known || image > frame * 1.01, y: !known || image < frame / 1.01 };
 }
 
-export function Appearance({ port, theme, onTheme, contrast, onContrast, weight, onWeight, reloadThemes, look, onLook }: Props) {
+export function Appearance({ port, theme, onTheme, contrast, onContrast, weight, onWeight, reloadThemes, look, onLook, nav, onNav }: Props) {
   const [packs, setPacks] = useState<ThemePack[]>([]);
   // null in a browser tab, where there is no window to keep running and no
   // icon to bring one back. The whole section goes with it.
@@ -273,6 +275,22 @@ export function Appearance({ port, theme, onTheme, contrast, onContrast, weight,
           </div>
         </section>
       )}
+
+      <section className="grp">
+        <div className="grp-hd">
+          <h2>{t("侧边栏")}</h2>
+        </div>
+        <p className="hint">{t("最左那一列图标不承载内容，收起后它的宽度让给对话。")}</p>
+        <div className="grp-items">
+          <div className="lrow">
+            <span className="tx">
+              <span className="lb">{t("显示图标栏")}</span>
+              <span className="ds">{t("会话、账号、设置这些入口都在这一列。收起后设置仍从顶栏进，这个选择只记在本机上")}</span>
+            </span>
+            <Switch on={nav} label={t("显示图标栏")} onClick={() => onNav(!nav)} />
+          </div>
+        </div>
+      </section>
 
       <section className="grp">
         <div className="grp-hd">

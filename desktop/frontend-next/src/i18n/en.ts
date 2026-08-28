@@ -295,6 +295,14 @@ export const EN: Record<string, string> = {
   "界面显示语言。模型回复所用的语言与此设置无关，将跟随你发送消息时使用的语言。": "The language of the interface. It does not affect the language the model replies in, which follows the language you write in.",
   "改语言要重开窗口才生效": "Changing the language reloads the window",
 
+  // ── 侧边栏 ─────────────────────────────────────────────────────
+  "侧边栏": "Sidebar",
+  "最左那一列图标不承载内容，收起后它的宽度让给对话。":
+    "The icon rail at the far left carries no content; folding it gives the width to the conversation.",
+  "显示图标栏": "Show the icon rail",
+  "会话、账号、设置这些入口都在这一列。收起后设置仍从顶栏进，这个选择只记在本机上":
+    "Session, account and settings live on this rail. Folded, settings stay in the top bar; the choice is kept on this machine.",
+
   // ── 明暗与配色 ───────────────────────────────────────────────────
   "明暗": "Light and dark",
   "浅色": "Light",

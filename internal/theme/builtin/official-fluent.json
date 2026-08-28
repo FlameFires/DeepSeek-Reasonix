@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "official-fluent",
+  "name": "Fluent 云母",
+  "author": "Reasonix Contributors",
+  "description": "Fluent 设计语言的分层与强调色：浅色是 Windows 11 的云母灰与系统蓝，深色是石墨面与亮蓝。圆角跟 Fluent 的 4/8 两档走；状态色（成功/警告/失败）保留应用语义，不跟主题换。",
+  "license": "MIT",
+  "tokens": {
+    "light": {
+      "bg": "#F3F3F3",
+      "bgSoft": "#F9F9F9",
+      "bgElev": "#EBEBEB",
+      "panel": "#FFFFFF",
+      "border": "#DEDEDE",
+      "borderSoft": "#EAEAEA",
+      "fg": "#1B1B1B",
+      "fgDim": "#5E5E5E",
+      "fgFaint": "#8A8A8A",
+      "accent": "#0067C0",
+      "accentFg": "#FFFFFF",
+      "radiusXs": "4px",
+      "radiusSm": "6px",
+      "radiusMd": "8px"
+    },
+    "dark": {
+      "bg": "#202020",
+      "bgSoft": "#272727",
+      "bgElev": "#323232",
+      "panel": "#2C2C2C",
+      "border": "#3D3D3D",
+      "borderSoft": "#303030",
+      "fg": "#FFFFFF",
+      "fgDim": "#C9C9C9",
+      "fgFaint": "#8F8F8F",
+      "accent": "#4CC2FF",
+      "accentFg": "#001B26",
+      "radiusXs": "4px",
+      "radiusSm": "6px",
+      "radiusMd": "8px"
+    }
+  }
+}

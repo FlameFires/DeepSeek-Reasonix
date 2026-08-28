@@ -302,6 +302,7 @@ function WorkspacesView({ hub, tree, runtimes, active, folded, reload, onFold, o
                         data-on={on ? "" : undefined}
                         data-live={session.runtimeId ? "" : undefined}
                         data-busy={busy === session.path ? "" : undefined}
+                        data-editing={editing === session.path ? "" : undefined}
                         onClick={() => void pick(ws, session)}
                       >
                         <i className="pip" />
@@ -330,47 +331,53 @@ function WorkspacesView({ hub, tree, runtimes, active, folded, reload, onFold, o
                         ) : (
                           <span className="sesstitle" title={session.title || session.name}>{session.title || session.name}</span>
                         )}
-                        <span className="sessmeta">{session.turns ? t("{n} 轮", { n: session.turns }) : t("空会话")}</span>
-                        {copies.length > 0 && (
-                          <button
-                            className="sesscopies"
-                            aria-expanded={open}
-                            title={t("这次对话被外部程序改写时留下的副本")}
-                            onClick={(ev) => {
-                              ev.stopPropagation();
-                              setSpread((prev) => {
-                                const next = new Set(prev);
-                                if (open) next.delete(session.path);
-                                else next.add(session.path);
-                                return next;
-                              });
-                            }}
-                          >
-                            {`+${copies.length}`}
-                          </button>
-                        )}
-                        <button
-                          className="sessedit-btn"
-                          title={t("重命名")}
-                          aria-label={t("重命名这个会话")}
-                          onClick={(ev) => {
-                            ev.stopPropagation();
-                            setEditing(session.path);
-                          }}
-                        >
-                          ✎
-                        </button>
-                        <button
-                          className="wsdel"
-                          title={t("删除这个会话")}
-                          aria-label={t("删除这个会话")}
-                          onClick={(ev) => {
-                            ev.stopPropagation();
-                            setConfirm(session.path);
-                          }}
-                        >
-                          ×
-                        </button>
+                        {/* 尾注与动作收进一块，动作才好浮在标题的尾巴上（见
+                            .sessacts），而不是从标题那里分走一列宽度。 */}
+                        <span className="sessend">
+                          {copies.length > 0 && (
+                            <button
+                              className="sesscopies"
+                              aria-expanded={open}
+                              title={t("这次对话被外部程序改写时留下的副本")}
+                              onClick={(ev) => {
+                                ev.stopPropagation();
+                                setSpread((prev) => {
+                                  const next = new Set(prev);
+                                  if (open) next.delete(session.path);
+                                  else next.add(session.path);
+                                  return next;
+                                });
+                              }}
+                            >
+                              {`+${copies.length}`}
+                            </button>
+                          )}
+                          <span className="sessmeta">{session.turns ? t("{n} 轮", { n: session.turns }) : t("空会话")}</span>
+                          <span className="sessacts">
+                            <button
+                              className="sessedit-btn"
+                              title={t("重命名")}
+                              aria-label={t("重命名这个会话")}
+                              onClick={(ev) => {
+                                ev.stopPropagation();
+                                setEditing(session.path);
+                              }}
+                            >
+                              ✎
+                            </button>
+                            <button
+                              className="wsdel"
+                              title={t("删除这个会话")}
+                              aria-label={t("删除这个会话")}
+                              onClick={(ev) => {
+                                ev.stopPropagation();
+                                setConfirm(session.path);
+                              }}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        </span>
                       </div>
                       {open &&
                         copies.map((copy) =>
@@ -394,18 +401,22 @@ function WorkspacesView({ hub, tree, runtimes, active, folded, reload, onFold, o
                             >
                               <i className="pip" />
                               <span className="sesstitle">{t("恢复副本")}</span>
-                              <span className="sessmeta">{copy.turns ? t("{n} 轮", { n: copy.turns }) : t("空会话")}</span>
-                              <button
-                                className="wsdel"
-                                title={t("删除这个会话")}
-                                aria-label={t("删除这个会话")}
-                                onClick={(ev) => {
-                                  ev.stopPropagation();
-                                  setConfirm(copy.path);
-                                }}
-                              >
-                                ×
-                              </button>
+                              <span className="sessend">
+                                <span className="sessmeta">{copy.turns ? t("{n} 轮", { n: copy.turns }) : t("空会话")}</span>
+                                <span className="sessacts">
+                                  <button
+                                    className="wsdel"
+                                    title={t("删除这个会话")}
+                                    aria-label={t("删除这个会话")}
+                                    onClick={(ev) => {
+                                      ev.stopPropagation();
+                                      setConfirm(copy.path);
+                                    }}
+                                  >
+                                    ×
+                                  </button>
+                                </span>
+                              </span>
                             </div>
                           ),
                         )}
